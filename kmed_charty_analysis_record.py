@@ -17,6 +17,8 @@ VoiceEMR 실증 데이터 - 음성 녹음 및 의무기록 작성 시간 분석
         (Mann-Whitney + HL 추정치+CI + Mixed-effects log-scale Ratio)
     4. 성별 / 경력 / 나이대별 elapsed2_kmed 분석
         (Mann-Whitney + HL 추정치+CI + Mixed-effects log-scale Ratio)
+    5. Period × Role 상호작용 모형 — Consultation duration / Documentation-completion time
+        (Exploratory, Supplement 전용)
 """
 
 import warnings
@@ -305,3 +307,88 @@ for title, cids_group in groups_demo_elapsed.items():
 
 print("\n[elapsed2_kmed] 성별 / 경력 / 나이대별")
 print(pd.DataFrame(rows).to_string(index=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# [셀 10] Period × Role 상호작용 모형 (Exploratory, Supplement 전용)
+#   log(y) ~ period + role_Resident + role_PA
+#           + period:role_Resident + period:role_PA + (1|C_ID)
+#   Reference: Attending × Pre
+# ──────────────────────────────────────────────────────────────────────────────
+ROLE_MAP = {
+    **{f"C{i:02d}": "PA"        for i in range(1,  6)},  # C01-C05
+    **{f"C{i:02d}": "Resident"  for i in range(6,  9)},  # C06-C08
+    **{f"C{i:02d}": "Attending" for i in range(9, 19)},  # C09-C18
+}
+
+# KMed_time / elapsed2_kmed 를 하나의 DataFrame으로 합산
+interaction_records = []
+for d in result_filtered1_elapsed:
+    if d["C_ID"] not in ROLE_MAP:
+        continue
+    interaction_records.append({
+        "C_ID":         d["C_ID"],
+        "role":         ROLE_MAP[d["C_ID"]],
+        "period":       "post" if d["date"] >= CUTOFF else "pre",
+        "KMed_time":    d["KMed_time"],
+        "elapsed2_kmed": d["elapsed2_kmed"],
+    })
+
+df_int = pd.DataFrame(interaction_records)
+
+OUTCOMES = {
+    "KMed_time":    "Consultation duration (KMed_time)",
+    "elapsed2_kmed": "Documentation-completion time (elapsed2_kmed)",
+}
+
+rows_a4 = []
+for outcome, label in OUTCOMES.items():
+    df_use = df_int[df_int[outcome] > 0].copy().dropna(subset=[outcome])
+    df_use["log_y"]           = np.log(df_use[outcome].astype(float))
+    df_use["post_int"]        = df_use["period"].eq("post").astype(int)
+    df_use["role_Resident"]   = df_use["role"].eq("Resident").astype(int)
+    df_use["role_PA"]         = df_use["role"].eq("PA").astype(int)
+    df_use["post_x_Resident"] = df_use["post_int"] * df_use["role_Resident"]
+    df_use["post_x_PA"]       = df_use["post_int"] * df_use["role_PA"]
+
+    sub = df_use.dropna(subset=["log_y", "C_ID"]).copy()
+    try:
+        result = MixedLM.from_formula(
+            "log_y ~ post_int + role_Resident + role_PA + post_x_Resident + post_x_PA",
+            groups="C_ID", data=sub,
+        ).fit(reml=True, method="lbfgs")
+        ci = result.conf_int()
+        for term in result.params.index:
+            coef = float(result.params[term])
+            lo   = float(ci.loc[term, 0])
+            hi   = float(ci.loc[term, 1])
+            pval = float(result.pvalues[term])
+            if   pval < 0.001: sig = "***"
+            elif pval < 0.01:  sig = "**"
+            elif pval < 0.05:  sig = "*"
+            elif pval < 0.1:   sig = "."
+            else:              sig = ""
+            rows_a4.append({
+                "Outcome":     label,
+                "Term":        term,
+                "Coef":        round(coef, 4),
+                "SE":          round(float(result.bse[term]), 4),
+                "CI_lo":       round(lo,   4),
+                "CI_hi":       round(hi,   4),
+                "Ratio (exp)": round(np.exp(coef), 3),
+                "p-value":     round(pval, 4),
+                "Sig":         sig,
+            })
+    except Exception as e:
+        rows_a4.append({"Outcome": label, "Term": "ERROR", "Coef": str(e),
+                        "SE": None, "CI_lo": None, "CI_hi": None,
+                        "Ratio (exp)": None, "p-value": None, "Sig": None})
+
+df_result_a4 = pd.DataFrame(rows_a4)
+for lbl in df_result_a4["Outcome"].unique():
+    print(f"\n=== Interaction Model | {lbl} ===")
+    print("  Reference: Attending (role), Pre (period)")
+    print(df_result_a4[df_result_a4["Outcome"] == lbl]
+          .drop(columns="Outcome").reset_index(drop=True).to_string(index=False))
+print("\npost_x_Resident / post_x_PA: 해당 역할의 pre→post 변화가 Attending 대비 얼마나 다른가.")
+print("결과는 exploratory / underpowered. Supplement 보고 전용.")
